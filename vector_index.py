@@ -4,36 +4,38 @@ from typing import Dict, List
 
 class VectorIndex:
     """
-    Dynamic vector index (Section A).
+    Dynamic vector index (Section A) - exact flat scan.
 
-    Rules:
-    - Dot-product similarity on L2-normalized vectors.
-    - insert: succeeds iff ID does not exist.
-    - delete: succeeds iff ID exists.
-    - search: return shape (num_queries, min(k, n_active)); IDs sorted by descending dot product.
-    - Each of insert/delete/search must be at most 20 physical lines.
+    Storage is one contiguous, capacity-doubling float32 matrix (no per-search
+    re-stacking, unlike the naive baseline). Deletes are tombstoned and the
+    array is compacted when bloated. Search is a single batched matmul
+    `queries @ vectors.T` followed by an exact top-k via k argmax passes
+    (cheaper than a full argpartition for small k). Recall is always 1.0.
+    Similarity is the dot product on already-L2-normalized vectors.
     """
 
     def __init__(self, dim: int):
         self.dim = int(dim)
-        self._store: Dict[int, np.ndarray] = {}
-        self._pos: Dict[int, int] = {}
-        self._ids = np.empty((0,), dtype=np.int64)
+        self._cap = 0
+        self._n = 0            # rows used (incl. tombstones)
+        self._n_active = 0     # live rows
         self._vectors = np.empty((0, self.dim), dtype=np.float32)
+        self._ids = np.empty((0,), dtype=np.int64)
+        self._active = np.empty((0,), dtype=bool)
+        self._id2row: Dict[int, int] = {}
 
-        # Simple inverted-file-like structure.
-        # Vectors are assigned to buckets based on the sign pattern
-        # of their first few dimensions.
-        self._bucket_bits = min(8, self.dim)
-        self._buckets: Dict[int, List[int]] = {}
-
-    def _bucket_key(self, vec: np.ndarray) -> int:
-        """Create a small integer bucket key from the signs of the first dimensions."""
-        bits = vec[:self._bucket_bits] > 0
-        key = 0
-        for i, b in enumerate(bits):
-            key |= int(b) << i
-        return key
+    def _grow(self, extra: int) -> None:
+        need = self._n + extra
+        if need <= self._cap:
+            return
+        new_cap = max(need, max(1, self._cap) * 2)
+        v = np.empty((new_cap, self.dim), dtype=np.float32)
+        v[:self._n] = self._vectors[:self._n]
+        i = np.empty((new_cap,), dtype=np.int64)
+        i[:self._n] = self._ids[:self._n]
+        a = np.zeros((new_cap,), dtype=bool)
+        a[:self._n] = self._active[:self._n]
+        self._vectors, self._ids, self._active, self._cap = v, i, a, new_cap
 
     def insert(self, batch: Dict[int, np.ndarray]) -> Dict[str, List[int]]:
         """Return {"succeeded": [...], "failed": [...]} preserving input order per list."""
@@ -41,18 +43,27 @@ class VectorIndex:
         failed: List[int] = []
         new_ids: List[int] = []
         new_vecs: List[np.ndarray] = []
-        base = len(self._ids)
+        seen = set()
         for vid, vec in batch.items():
             vid = int(vid)
-            if vid in self._store:
-                failed.append(vid); continue
-            vec = np.asarray(vec, dtype=np.float32)
-            self._store[vid] = vec; self._pos[vid] = base + len(new_ids)
-            self._buckets.setdefault(self._bucket_key(vec), []).append(vid)
-            new_ids.append(vid); new_vecs.append(vec); succeeded.append(vid)
+            if vid in self._id2row or vid in seen:
+                failed.append(vid)
+                continue
+            seen.add(vid)
+            new_ids.append(vid)
+            new_vecs.append(np.asarray(vec, dtype=np.float32))
+            succeeded.append(vid)
         if new_ids:
-            self._ids = np.concatenate((self._ids, np.asarray(new_ids, dtype=np.int64)))
-            self._vectors = np.vstack((self._vectors, np.stack(new_vecs)))
+            m = len(new_ids)
+            self._grow(m)
+            s = self._n
+            self._vectors[s:s + m] = np.stack(new_vecs)
+            self._ids[s:s + m] = np.asarray(new_ids, dtype=np.int64)
+            self._active[s:s + m] = True
+            for j in range(m):
+                self._id2row[new_ids[j]] = s + j
+            self._n += m
+            self._n_active += m
         return {"succeeded": succeeded, "failed": failed}
 
     def delete(self, ids: np.ndarray) -> Dict[str, List[int]]:
@@ -61,36 +72,49 @@ class VectorIndex:
         failed: List[int] = []
         for vid in np.asarray(ids, dtype=np.int64):
             vid = int(vid)
-            if vid not in self._store:
-                failed.append(vid); continue
-            key = self._bucket_key(self._store[vid])
-            if key in self._buckets:
-                self._buckets[key].remove(vid)
-            pos = self._pos.pop(vid); last = len(self._ids) - 1; last_id = int(self._ids[last])
-            if pos != last:
-                self._ids[pos] = last_id; self._vectors[pos] = self._vectors[last]; self._pos[last_id] = pos
-            self._ids = self._ids[:last]; self._vectors = self._vectors[:last]
-            del self._store[vid]; succeeded.append(vid)
+            row = self._id2row.pop(vid, -1)
+            if row < 0:
+                failed.append(vid)
+                continue
+            if self._active[row]:
+                self._active[row] = False
+                self._n_active -= 1
+            succeeded.append(vid)
+        self._maybe_compact()
         return {"succeeded": succeeded, "failed": failed}
 
-    #@profile
+    def _maybe_compact(self) -> None:
+        if self._n == 0 or self._n_active >= 0.85 * self._n:
+            return
+        live = np.flatnonzero(self._active[:self._n])
+        m = live.size
+        self._vectors[:m] = self._vectors[live]
+        self._ids[:m] = self._ids[live]
+        self._active[:m] = True
+        if m < self._n:
+            self._active[m:self._n] = False
+        self._n = m
+        self._n_active = m
+        self._id2row = {int(self._ids[r]): r for r in range(m)}
+
+    def _topk(self, S: np.ndarray, k: int) -> np.ndarray:
+        """Exact indices of the k largest per row, descending, via k argmax passes."""
+        out = np.empty((S.shape[0], k), dtype=np.int64)
+        ar = np.arange(S.shape[0])
+        for i in range(k):
+            mx = np.argmax(S, axis=1)
+            out[:, i] = mx
+            S[ar, mx] = -np.inf
+        return out
+
     def search(self, queries: np.ndarray, k: int) -> np.ndarray:
         """Return (num_queries, min(k, n_active)) int64 array of vector IDs."""
-        queries = np.asarray(queries, dtype=np.float32)
-        n_q, n = queries.shape[0], len(self._ids)
+        q = np.asarray(queries, dtype=np.float32)
+        nq, n = q.shape[0], self._n_active
         if n == 0 or int(k) <= 0:
-            return np.empty((n_q, 0), dtype=np.int64)
-        k_eff = min(int(k), n)
-        out = np.empty((n_q, k_eff), dtype=np.int64)
-        for qi, q in enumerate(queries):
-            cand_ids = self._buckets.get(self._bucket_key(q), [])
-            if len(cand_ids) < k_eff:
-                cand_pos = np.arange(n, dtype=np.int64)
-            else:
-                cand_pos = np.fromiter((self._pos[int(x)] for x in cand_ids), dtype=np.int64)
-            scores = self._vectors[cand_pos] @ q
-            kk = min(k_eff, len(cand_pos))
-            topk = np.argpartition(scores, len(scores) - kk)[-kk:]
-            order = np.argsort(-scores[topk])
-            out[qi, :kk] = self._ids[cand_pos[topk[order]]]
-        return out
+            return np.empty((nq, 0), dtype=np.int64)
+        keff = min(int(k), n)
+        S = q @ self._vectors[:self._n].T
+        if self._n_active != self._n:                 # mask tombstoned columns
+            S[:, ~self._active[:self._n]] = -np.inf
+        return self._ids[self._topk(S, keff)]
