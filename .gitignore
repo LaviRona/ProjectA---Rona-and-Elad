@@ -2,3 +2,4 @@ data/
 Project A.pdf
 __pycache__/
 *.pyc
+*.zip
