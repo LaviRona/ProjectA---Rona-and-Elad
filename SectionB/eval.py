@@ -10,7 +10,7 @@ import math
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Sequence, Set
 
-from SectionB.utils import K_EVAL, normalize_page_id
+from utils import K_EVAL, normalize_page_id
 
 __all__ = [
     "K_EVAL",

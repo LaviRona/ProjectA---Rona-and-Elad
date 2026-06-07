@@ -7,7 +7,7 @@ from pathlib import Path
 STUDENT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(STUDENT_ROOT))
 
-from SectionB.main import build_offline_index
+from main import build_offline_index
 
 
 if __name__ == "__main__":

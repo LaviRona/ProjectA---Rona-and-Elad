@@ -8,9 +8,9 @@ from pathlib import Path
 STUDENT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(STUDENT_ROOT))
 
-from SectionB.eval import evaluate_run, load_query_file
-from SectionB.main import run
-from SectionB.utils import PUBLIC_QUERIES_PATH
+from eval import evaluate_run, load_query_file
+from main import run
+from utils import PUBLIC_QUERIES_PATH
 
 
 def main() -> None:
