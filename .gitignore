@@ -3,3 +3,6 @@ Project A.pdf
 __pycache__/
 *.pyc
 *.zip
+Section A/custom_scenarios/
+Section A/custom_scenarios_elad/
+Section A/run_all/
