@@ -56,7 +56,7 @@ class VectorIndex:
         self._id2row = {int(self._ids[i]): i for i in range(m)}
 
     def _maybe_compact(self) -> None:
-        if self._n and self._n_active < 0.95 * self._n:
+        if self._n and self._n_active < 0.98 * self._n:
             self._compact()
 
     def insert(self, batch: Dict[int, np.ndarray]) -> Dict[str, List[int]]:
