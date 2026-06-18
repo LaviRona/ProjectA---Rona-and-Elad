@@ -8,7 +8,7 @@ scored (mean NDCG@10).
 
 | Stage | File | Method |
 |-------|------|--------|
-| Chunk | `chunk.py` | Overlapping fixed-size **word windows** (200 words, 40 overlap), title prepended to each chunk, capped at 60 chunks/page. |
+| Chunk | `chunk.py` | Overlapping fixed-size **word windows** (180 words, 30 overlap), title prepended to each chunk, capped at 60 chunks/page. |
 | Embed | `embed.py` | `sentence-transformers/all-MiniLM-L6-v2`, L2-normalized, 384-dim. |
 | Index | `index.py` | Each page = **mean of its chunk vectors** (one un-normalized centroid per page), stored float16. |
 | Retrieve | `retrieve.py` | Exact dot-product search over page centroids, top-10. |
@@ -34,7 +34,8 @@ coefficient on only 50 queries).
 ## Setup
 
 ```bash
-cd SectionB
+git clone https://github.com/LaviRona/ProjectA---Rona-and-Elad.git
+cd ProjectA---Rona-and-Elad
 pip install -r requirements.txt
 ```
 
